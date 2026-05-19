@@ -4,11 +4,13 @@ One of Crawl4AI's most powerful features is its ability to perform **configurabl
 
 In this tutorial, you'll learn:
 
-1. How to set up a **Basic Deep Crawler** with BFS strategy  
-2. Understanding the difference between **streamed and non-streamed** output  
-3. Implementing **filters and scorers** to target specific content  
-4. Creating **advanced filtering chains** for sophisticated crawls  
-5. Using **BestFirstCrawling** for intelligent exploration prioritization  
+1. How to set up a **Basic Deep Crawler** with BFS strategy
+2. Understanding the difference between **streamed and non-streamed** output
+3. Implementing **filters and scorers** to target specific content
+4. Creating **advanced filtering chains** for sophisticated crawls
+5. Using **BestFirstCrawling** for intelligent exploration prioritization
+6. **Crash recovery** for long-running production crawls
+7. **Prefetch mode** for fast URL discovery  
 
 > **Prerequisites**  
 > - You’ve completed or read [AsyncWebCrawler Basics](../core/simple-crawling.md) to understand how to run a simple crawl.  
@@ -485,7 +487,410 @@ This is especially useful for security-conscious crawling or when dealing with s
 
 ---
 
-## 10. Summary & Next Steps
+## 10. Crash Recovery for Long-Running Crawls
+
+For production deployments, especially in cloud environments where instances can be terminated unexpectedly, Crawl4AI provides built-in crash recovery support for all deep crawl strategies.
+
+### 10.1 Enabling State Persistence
+
+All deep crawl strategies (BFS, DFS, Best-First) support two optional parameters:
+
+- **`resume_state`**: Pass a previously saved state to resume from a checkpoint
+- **`on_state_change`**: Async callback fired after each URL is processed
+
+```python
+from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+import json
+
+# Callback to save state after each URL
+async def save_state_to_redis(state: dict):
+    await redis.set("crawl_state", json.dumps(state))
+
+strategy = BFSDeepCrawlStrategy(
+    max_depth=3,
+    on_state_change=save_state_to_redis,  # Called after each URL
+)
+```
+
+### 10.2 State Structure
+
+The state dictionary is JSON-serializable and contains:
+
+```python
+{
+    "strategy_type": "bfs",  # or "dfs", "best_first"
+    "visited": ["url1", "url2", ...],  # Already crawled URLs
+    "pending": [{"url": "...", "parent_url": "..."}],  # Queue/stack
+    "depths": {"url1": 0, "url2": 1},  # Depth tracking
+    "pages_crawled": 42  # Counter
+}
+```
+
+### 10.3 Resuming from a Checkpoint
+
+```python
+import json
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+
+# Load saved state (e.g., from Redis, database, or file)
+saved_state = json.loads(await redis.get("crawl_state"))
+
+# Resume crawling from where we left off
+strategy = BFSDeepCrawlStrategy(
+    max_depth=3,
+    resume_state=saved_state,  # Continue from checkpoint
+    on_state_change=save_state_to_redis,  # Keep saving progress
+)
+
+config = CrawlerRunConfig(deep_crawl_strategy=strategy)
+
+async with AsyncWebCrawler() as crawler:
+    # Will skip already-visited URLs and continue from pending queue
+    results = await crawler.arun(start_url, config=config)
+```
+
+### 10.4 Manual State Export
+
+You can export the last captured state using `export_state()`. Note that this requires `on_state_change` to be set (state is captured in the callback):
+
+```python
+import json
+
+captured_state = None
+
+async def capture_state(state: dict):
+    global captured_state
+    captured_state = state
+
+strategy = BFSDeepCrawlStrategy(
+    max_depth=2,
+    on_state_change=capture_state,  # Required for state capture
+)
+config = CrawlerRunConfig(deep_crawl_strategy=strategy)
+
+async with AsyncWebCrawler() as crawler:
+    results = await crawler.arun(start_url, config=config)
+
+# Get the last captured state
+state = strategy.export_state()
+if state:
+    # Save to your preferred storage
+    with open("crawl_checkpoint.json", "w") as f:
+        json.dump(state, f)
+```
+
+### 10.5 Complete Example: Redis-Based Recovery
+
+```python
+import asyncio
+import json
+import redis.asyncio as redis
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+
+REDIS_KEY = "crawl4ai:crawl_state"
+
+async def main():
+    redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+    # Check for existing state
+    saved_state = None
+    existing = await redis_client.get(REDIS_KEY)
+    if existing:
+        saved_state = json.loads(existing)
+        print(f"Resuming from checkpoint: {saved_state['pages_crawled']} pages already crawled")
+
+    # State persistence callback
+    async def persist_state(state: dict):
+        await redis_client.set(REDIS_KEY, json.dumps(state))
+
+    # Create strategy with recovery support
+    strategy = BFSDeepCrawlStrategy(
+        max_depth=3,
+        max_pages=100,
+        resume_state=saved_state,
+        on_state_change=persist_state,
+    )
+
+    config = CrawlerRunConfig(deep_crawl_strategy=strategy, stream=True)
+
+    try:
+        async with AsyncWebCrawler() as crawler:
+            async for result in await crawler.arun("https://example.com", config=config):
+                print(f"Crawled: {result.url}")
+    except Exception as e:
+        print(f"Crawl interrupted: {e}")
+        print("State saved - restart to resume")
+    finally:
+        await redis_client.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 10.6 Zero Overhead
+
+When `resume_state=None` and `on_state_change=None` (the defaults), there is no performance impact. State tracking only activates when you enable these features.
+
+---
+
+## 11. Cancellation Support for Deep Crawls
+
+For production environments like cloud platforms, you often need to stop a running crawl mid-execution—whether the user changed their mind, specified the wrong URL, or wants to control costs. Crawl4AI provides built-in cancellation support for all deep crawl strategies.
+
+### 11.1 Two Ways to Cancel
+
+**Option A: Callback-based cancellation** (recommended for external systems)
+
+Use `should_cancel` to check an external source (Redis, database, API) before each URL:
+
+```python
+from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+
+async def check_if_cancelled():
+    # Check Redis, database, or any external source
+    job = await redis.get(f"job:{job_id}")
+    return job.get("status") == "cancelled"
+
+strategy = BFSDeepCrawlStrategy(
+    max_depth=3,
+    max_pages=1000,
+    should_cancel=check_if_cancelled,  # Called before each URL
+)
+```
+
+**Option B: Direct cancellation** (for in-process control)
+
+Call `cancel()` directly on the strategy instance:
+
+```python
+strategy = BFSDeepCrawlStrategy(max_depth=3, max_pages=1000)
+
+# In another coroutine or thread:
+strategy.cancel()  # Thread-safe, stops before next URL
+```
+
+### 11.2 Checking Cancellation Status
+
+Use the `cancelled` property to check if a crawl was cancelled:
+
+```python
+async with AsyncWebCrawler() as crawler:
+    results = await crawler.arun(url, config=config)
+
+if strategy.cancelled:
+    print(f"Crawl was cancelled after {len(results)} pages")
+else:
+    print(f"Crawl completed with {len(results)} pages")
+```
+
+### 11.3 State Notifications Include Cancelled Flag
+
+When using `on_state_change`, the state dictionary includes a `cancelled` field:
+
+```python
+async def handle_state(state: dict):
+    if state.get("cancelled"):
+        print("Crawl was cancelled!")
+        print(f"Crawled {state['pages_crawled']} pages before cancellation")
+    # Save state for potential resume
+    await redis.set("crawl_state", json.dumps(state))
+
+strategy = BFSDeepCrawlStrategy(
+    max_depth=3,
+    should_cancel=check_cancelled,
+    on_state_change=handle_state,
+)
+```
+
+### 11.4 Key Behaviors
+
+| Scenario | Behavior |
+|----------|----------|
+| Cancel before first URL | Returns empty results, `cancelled=True` |
+| Cancel during crawl | Completes current URL, then stops |
+| Callback raises exception | Logged as warning, crawl continues (fail-open) |
+| Strategy reuse after cancel | Works normally (cancel flag auto-resets) |
+| Sync callback function | Supported (auto-detected and handled) |
+
+### 11.5 Complete Example: Cloud Platform Job Cancellation
+
+```python
+import asyncio
+import json
+import redis.asyncio as redis
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+
+async def run_cancellable_crawl(job_id: str, start_url: str):
+    redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+    # Check external cancellation source
+    async def check_cancelled():
+        status = await redis_client.get(f"job:{job_id}:status")
+        return status == b"cancelled"
+
+    # Save progress for monitoring and recovery
+    async def save_progress(state: dict):
+        await redis_client.set(
+            f"job:{job_id}:state",
+            json.dumps(state)
+        )
+        # Update job progress
+        await redis_client.set(
+            f"job:{job_id}:pages_crawled",
+            state["pages_crawled"]
+        )
+
+    strategy = BFSDeepCrawlStrategy(
+        max_depth=3,
+        max_pages=500,
+        should_cancel=check_cancelled,
+        on_state_change=save_progress,
+    )
+
+    config = CrawlerRunConfig(
+        deep_crawl_strategy=strategy,
+        stream=True,
+    )
+
+    results = []
+    try:
+        async with AsyncWebCrawler() as crawler:
+            async for result in await crawler.arun(start_url, config=config):
+                results.append(result)
+                print(f"Crawled: {result.url}")
+    finally:
+        # Report final status
+        if strategy.cancelled:
+            await redis_client.set(f"job:{job_id}:status", "cancelled")
+            print(f"Job cancelled after {len(results)} pages")
+        else:
+            await redis_client.set(f"job:{job_id}:status", "completed")
+            print(f"Job completed with {len(results)} pages")
+
+        await redis_client.close()
+
+    return results
+
+# Usage
+# asyncio.run(run_cancellable_crawl("job-123", "https://example.com"))
+#
+# To cancel from another process:
+# redis_client.set("job:job-123:status", "cancelled")
+```
+
+### 11.6 Supported Strategies
+
+Cancellation works identically across all deep crawl strategies:
+
+- **BFSDeepCrawlStrategy** - Breadth-first search
+- **DFSDeepCrawlStrategy** - Depth-first search
+- **BestFirstCrawlingStrategy** - Priority-based crawling
+
+All strategies support:
+- `should_cancel` callback parameter
+- `cancel()` method
+- `cancelled` property
+
+---
+
+## 12. Prefetch Mode for Fast URL Discovery
+
+When you need to quickly discover URLs without full page processing, use **prefetch mode**. This is ideal for two-phase crawling where you first map the site, then selectively process specific pages.
+
+### 12.1 Enabling Prefetch Mode
+
+```python
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+
+config = CrawlerRunConfig(prefetch=True)
+
+async with AsyncWebCrawler() as crawler:
+    result = await crawler.arun("https://example.com", config=config)
+
+    # Result contains only HTML and links - no markdown, no extraction
+    print(f"Found {len(result.links['internal'])} internal links")
+    print(f"Found {len(result.links['external'])} external links")
+```
+
+### 12.2 What Gets Skipped
+
+Prefetch mode uses a fast path that bypasses heavy processing:
+
+| Processing Step | Normal Mode | Prefetch Mode |
+|----------------|-------------|---------------|
+| Fetch HTML | ✅ | ✅ |
+| Extract links | ✅ | ✅ (fast `quick_extract_links()`) |
+| Generate markdown | ✅ | ❌ Skipped |
+| Content scraping | ✅ | ❌ Skipped |
+| Media extraction | ✅ | ❌ Skipped |
+| LLM extraction | ✅ | ❌ Skipped |
+
+### 12.3 Performance Benefit
+
+- **Normal mode**: Full pipeline (~2-5 seconds per page)
+- **Prefetch mode**: HTML + links only (~200-500ms per page)
+
+This makes prefetch mode **5-10x faster** for URL discovery.
+
+### 12.4 Two-Phase Crawling Pattern
+
+The most common use case is two-phase crawling:
+
+```python
+import asyncio
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+
+async def two_phase_crawl(start_url: str):
+    async with AsyncWebCrawler() as crawler:
+        # ═══════════════════════════════════════════════
+        # Phase 1: Fast discovery (prefetch mode)
+        # ═══════════════════════════════════════════════
+        prefetch_config = CrawlerRunConfig(prefetch=True)
+        discovery = await crawler.arun(start_url, config=prefetch_config)
+
+        all_urls = [link["href"] for link in discovery.links.get("internal", [])]
+        print(f"Discovered {len(all_urls)} URLs")
+
+        # Filter to URLs you care about
+        blog_urls = [url for url in all_urls if "/blog/" in url]
+        print(f"Found {len(blog_urls)} blog posts to process")
+
+        # ═══════════════════════════════════════════════
+        # Phase 2: Full processing on selected URLs only
+        # ═══════════════════════════════════════════════
+        full_config = CrawlerRunConfig(
+            # Your normal extraction settings
+            word_count_threshold=100,
+            remove_overlay_elements=True,
+        )
+
+        results = []
+        for url in blog_urls:
+            result = await crawler.arun(url, config=full_config)
+            if result.success:
+                results.append(result)
+                print(f"Processed: {url}")
+
+        return results
+
+if __name__ == "__main__":
+    results = asyncio.run(two_phase_crawl("https://example.com"))
+    print(f"Fully processed {len(results)} pages")
+```
+
+### 12.5 Use Cases
+
+- **Site mapping**: Quickly discover all URLs before deciding what to process
+- **Link validation**: Check which pages exist without heavy processing
+- **Selective deep crawl**: Prefetch to find URLs, filter by pattern, then full crawl
+- **Crawl planning**: Estimate crawl size before committing resources
+
+---
+
+## 13. Summary & Next Steps
 
 In this **Deep Crawling with Crawl4AI** tutorial, you learned to:
 
@@ -495,5 +900,8 @@ In this **Deep Crawling with Crawl4AI** tutorial, you learned to:
 - Use scorers to prioritize the most relevant pages
 - Limit crawls with `max_pages` and `score_threshold` parameters
 - Build a complete advanced crawler with combined techniques
+- **Implement crash recovery** with `resume_state` and `on_state_change` for production deployments
+- **Cancel running crawls** with `should_cancel` callback or `cancel()` method for cloud platform job management
+- **Use prefetch mode** for fast URL discovery and two-phase crawling
 
 With these tools, you can efficiently extract structured data from websites at scale, focusing precisely on the content you need for your specific use case.

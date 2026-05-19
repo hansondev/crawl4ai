@@ -37,13 +37,15 @@ Limited slots._
 
 Crawl4AI turns the web into clean, LLM ready Markdown for RAG, agents, and data pipelines. Fast, controllable, battle tested by a 50k+ star community.
 
-[✨ Check out latest update v0.7.8](#-recent-updates)
+[✨ Check out latest update v0.8.6](#-recent-updates)
 
-✨ **New in v0.7.8**: Stability & Bug Fix Release! 11 bug fixes addressing Docker API issues (ContentRelevanceFilter, ProxyConfig, cache permissions), LLM extraction improvements (configurable backoff, HTML input format), URL handling fixes, and dependency updates (pypdf, Pydantic v2). [Release notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.7.8.md)
+✨ **New in v0.8.6**: Security hotfix — replaced `litellm` with `unclecode-litellm` due to a PyPI supply chain compromise. If you're on v0.8.5, please upgrade immediately.
 
-✨ Recent v0.7.7: Complete Self-Hosting Platform with Real-time Monitoring! Enterprise-grade monitoring dashboard, comprehensive REST API, WebSocket streaming, smart browser pool management, and production-ready observability. [Release notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.7.7.md)
+✨ Recent v0.8.5: Anti-Bot Detection, Shadow DOM & 60+ Bug Fixes! Automatic 3-tier anti-bot detection with proxy escalation, Shadow DOM flattening, deep crawl cancellation, config defaults API, consent popup removal, and critical security patches. [Release notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.8.5.md)
 
-✨ Previous v0.7.6: Complete Webhook Infrastructure for Docker Job Queue API! Real-time notifications for both `/crawl/job` and `/llm/job` endpoints with exponential backoff retry, custom headers, and flexible delivery modes. [Release notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.7.6.md)
+✨ Previous v0.8.0: Crash Recovery & Prefetch Mode! Deep crawl crash recovery with `resume_state` and `on_state_change` callbacks for long-running crawls. New `prefetch=True` mode for 5-10x faster URL discovery. [Release notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.8.0.md)
+
+✨ Previous v0.7.8: Stability & Bug Fix Release! 11 bug fixes addressing Docker API issues, LLM extraction improvements, URL handling fixes, and dependency updates. [Release notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.7.8.md)
 
 <details>
   <summary>🤓 <strong>My Personal Story</strong></summary>
@@ -562,6 +564,98 @@ async def test_news_crawl():
 
 ## ✨ Recent Updates
 
+<details open>
+<summary><strong>Version 0.8.6 — Security Hotfix: litellm Supply Chain Fix</strong></summary>
+
+Replaced `litellm` dependency with `unclecode-litellm` due to a PyPI supply chain compromise affecting the original package. If you're on v0.8.5 or earlier, upgrade immediately.
+
+```bash
+pip install -U crawl4ai
+```
+
+</details>
+
+<details>
+<summary><strong>Version 0.8.5 Release Highlights - Anti-Bot Detection, Shadow DOM & 60+ Bug Fixes</strong></summary>
+
+Our biggest release since v0.8.0. Anti-bot detection with proxy escalation, Shadow DOM flattening, deep crawl cancellation, and over 60 bug fixes.
+
+- **🛡️ Anti-Bot Detection & Proxy Escalation**:
+  - 3-tier detection: known vendors, generic block indicators, structural integrity checks
+  - Automatic retry with proxy chain and fallback fetch function
+  ```python
+  from crawl4ai import CrawlerRunConfig
+  from crawl4ai.async_configs import ProxyConfig
+
+  config = CrawlerRunConfig(
+      proxy_config=[ProxyConfig.DIRECT, ProxyConfig(server="http://my-proxy:8080")],
+      max_retries=2,
+      fallback_fetch_function=my_web_unlocker,
+  )
+  ```
+
+- **🌑 Shadow DOM Flattening**:
+  - Extract content hidden inside shadow DOM components
+  ```python
+  config = CrawlerRunConfig(flatten_shadow_dom=True)
+  ```
+
+- **🛑 Deep Crawl Cancellation**:
+  - Stop long crawls gracefully with `cancel()` or `should_cancel` callback
+  - Works with BFS, DFS, and BestFirst strategies
+
+- **⚙️ Config Defaults API**:
+  - `set_defaults()` / `get_defaults()` / `reset_defaults()` on BrowserConfig and CrawlerRunConfig
+
+- **🔒 Critical Security Fixes**:
+  - RCE via deserialization in Docker `/crawl` endpoint — removed `eval()`, added allowlist
+  - Redis CVE-2025-49844 (CVSS 10.0) — upgraded to 7.2.7
+
+- **60+ Bug Fixes** across browser management, proxy, deep crawling, extraction, CLI, and Docker
+
+[Full v0.8.5 Release Notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.8.5.md)
+
+</details>
+
+<details>
+<summary><strong>Version 0.8.0 Release Highlights - Crash Recovery & Prefetch Mode</strong></summary>
+
+This release introduces crash recovery for deep crawls, a new prefetch mode for fast URL discovery, and critical security fixes for Docker deployments.
+
+- **🔄 Deep Crawl Crash Recovery**:
+  - `on_state_change` callback fires after each URL for real-time state persistence
+  - `resume_state` parameter to continue from a saved checkpoint
+  - JSON-serializable state for Redis/database storage
+  - Works with BFS, DFS, and Best-First strategies
+  ```python
+  from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+
+  strategy = BFSDeepCrawlStrategy(
+      max_depth=3,
+      resume_state=saved_state,  # Continue from checkpoint
+      on_state_change=save_to_redis,  # Called after each URL
+  )
+  ```
+
+- **⚡ Prefetch Mode for Fast URL Discovery**:
+  - `prefetch=True` skips markdown, extraction, and media processing
+  - 5-10x faster than full processing
+  - Perfect for two-phase crawling: discover first, process selectively
+  ```python
+  config = CrawlerRunConfig(prefetch=True)
+  result = await crawler.arun("https://example.com", config=config)
+  # Returns HTML and links only - no markdown generation
+  ```
+
+- **🔒 Security Fixes (Docker API)**:
+  - Hooks disabled by default (`CRAWL4AI_HOOKS_ENABLED=false`)
+  - `file://` URLs blocked on API endpoints to prevent LFI
+  - `__import__` removed from hook execution sandbox
+
+[Full v0.8.0 Release Notes →](https://github.com/unclecode/crawl4ai/blob/main/docs/blog/release-v0.8.0.md)
+
+</details>
+
 <details>
 <summary><strong>Version 0.7.8 Release Highlights - Stability & Bug Fix Release</strong></summary>
 
@@ -766,21 +860,21 @@ This release focuses on stability with 11 bug fixes addressing issues reported b
   ```
 
 - **🎨 Multi-URL Configuration**: Different strategies for different URL patterns in one batch:
-  ```python
-  from crawl4ai import CrawlerRunConfig, MatchMode
+```python
+from crawl4ai import CrawlerRunConfig, MatchMode, CacheMode
   
   configs = [
       # Documentation sites - aggressive caching
       CrawlerRunConfig(
           url_matcher=["*docs*", "*documentation*"],
-          cache_mode="write",
+          cache_mode=CacheMode.WRITE_ONLY,
           markdown_generator_options={"include_links": True}
       ),
       
       # News/blog sites - fresh content
       CrawlerRunConfig(
           url_matcher=lambda url: 'blog' in url or 'news' in url,
-          cache_mode="bypass"
+          cache_mode=CacheMode.BYPASS
       ),
       
       # Fallback for everything else

@@ -7,8 +7,9 @@ Crawl4AI FastAPI entry‑point
 """
 
 # ── stdlib & 3rd‑party imports ───────────────────────────────
-from crawler_pool import get_crawler, close_all, janitor
+from crawler_pool import get_crawler, release_crawler, close_all, janitor
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from crawl4ai.__version__ import __version__
 from auth import create_access_token, get_token_dependency, TokenRequest
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -73,11 +74,15 @@ sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 config = load_config()
 setup_logging(config)
 
-__version__ = "0.5.1-d1"
+# Version is imported from crawl4ai package to ensure it stays in sync
 
 # ── global page semaphore (hard cap) ─────────────────────────
 MAX_PAGES = config["crawler"]["pool"].get("max_pages", 30)
 GLOBAL_SEM = asyncio.Semaphore(MAX_PAGES)
+
+# ── security feature flags ───────────────────────────────────
+# Hooks are disabled by default for security (RCE risk). Set to "true" to enable.
+HOOKS_ENABLED = os.environ.get("CRAWL4AI_HOOKS_ENABLED", "false").lower() == "true"
 
 # ── default browser config helper ─────────────────────────────
 def get_default_browser_config() -> BrowserConfig:
@@ -200,7 +205,18 @@ async def root():
     return RedirectResponse("/playground")
 
 # ─────────────────── infra / middleware  ─────────────────────
-redis = aioredis.from_url(config["redis"].get("uri", "redis://localhost"))
+def _build_redis_url(config: dict) -> str:
+    """Build Redis URL from config fields and environment variables."""
+    rc = config.get("redis", {})
+    host = os.environ.get("REDIS_HOST", rc.get("host", "localhost"))
+    port = os.environ.get("REDIS_PORT", rc.get("port", 6379))
+    password = os.environ.get("REDIS_PASSWORD", rc.get("password", ""))
+    db = rc.get("db", 0)
+    scheme = "rediss" if rc.get("ssl", False) else "redis"
+    auth = f":{password}@" if password else ""
+    return f"{scheme}://{auth}{host}:{port}/{db}"
+
+redis = aioredis.from_url(_build_redis_url(config))
 
 limiter = Limiter(
     key_func=get_remote_address,
@@ -235,6 +251,19 @@ async def add_security_headers(request: Request, call_next):
     if config["security"]["enabled"]:
         resp.headers.update(config["security"]["headers"])
     return resp
+
+# ───────────────── URL validation helper ─────────────────
+ALLOWED_URL_SCHEMES = ("http://", "https://")
+ALLOWED_URL_SCHEMES_WITH_RAW = ("http://", "https://", "raw:", "raw://")
+
+
+def validate_url_scheme(url: str, allow_raw: bool = False) -> None:
+    """Validate URL scheme to prevent file:// LFI attacks."""
+    allowed = ALLOWED_URL_SCHEMES_WITH_RAW if allow_raw else ALLOWED_URL_SCHEMES
+    if not url.startswith(allowed):
+        schemes = ", ".join(allowed)
+        raise HTTPException(400, f"URL must start with {schemes}")
+
 
 # ───────────────── safe config‑dump helper ─────────────────
 ALLOWED_TYPES = {
@@ -286,6 +315,9 @@ logger = logging.getLogger(__name__)
 # ──────────────────────── Endpoints ──────────────────────────
 @app.post("/token")
 async def get_token(req: TokenRequest):
+    expected_token = config.get("security", {}).get("api_token", "")
+    if expected_token and req.api_token != expected_token:
+        raise HTTPException(401, "Invalid or missing api_token")
     if not verify_email_domain(req.email):
         raise HTTPException(400, "Invalid email domain")
     token = create_access_token({"sub": req.email})
@@ -308,6 +340,17 @@ async def get_markdown(
     body: MarkdownRequest,
     _td: Dict = Depends(token_dep),
 ):
+    """
+    Convert a web page into Markdown format.
+
+    Supports multiple extraction modes:
+    - fit (default): Readability-based extraction for clean content
+    - raw: Direct DOM to Markdown conversion
+    - bm25: BM25 relevance ranking with optional query
+    - llm: LLM-based summarization with optional query
+
+    Use this tool when you need clean, readable text from web pages.
+    """
     if not body.url.startswith(("http://", "https://")) and not body.url.startswith(("raw:", "raw://")):
         raise HTTPException(
             400, "Invalid URL format. Must start with http://, https://, or for raw HTML (raw:, raw://)")
@@ -337,8 +380,9 @@ async def generate_html(
     Crawls the URL, preprocesses the raw HTML for schema extraction, and returns the processed HTML.
     Use when you need sanitized HTML structures for building schemas or further processing.
     """
-    from crawler_pool import get_crawler
+    validate_url_scheme(body.url, allow_raw=True)
     cfg = CrawlerRunConfig()
+    crawler = None
     try:
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
@@ -351,6 +395,9 @@ async def generate_html(
         return JSONResponse({"html": processed_html, "url": body.url, "success": True})
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+    finally:
+        if crawler:
+            await release_crawler(crawler)
 
 # Screenshot endpoint
 
@@ -368,9 +415,10 @@ async def generate_screenshot(
     Use when you need an image snapshot of the rendered page. Its recommened to provide an output path to save the screenshot.
     Then in result instead of the screenshot you will get a path to the saved file.
     """
-    from crawler_pool import get_crawler
+    validate_url_scheme(body.url)
+    crawler = None
     try:
-        cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for)
+        cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for, wait_for_images=body.wait_for_images)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
@@ -385,6 +433,9 @@ async def generate_screenshot(
         return {"success": True, "screenshot": screenshot_data}
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+    finally:
+        if crawler:
+            await release_crawler(crawler)
 
 # PDF endpoint
 
@@ -402,7 +453,8 @@ async def generate_pdf(
     Use when you need a printable or archivable snapshot of the page. It is recommended to provide an output path to save the PDF.
     Then in result instead of the PDF you will get a path to the saved file.
     """
-    from crawler_pool import get_crawler
+    validate_url_scheme(body.url)
+    crawler = None
     try:
         cfg = CrawlerRunConfig(pdf=True)
         crawler = await get_crawler(get_default_browser_config())
@@ -419,6 +471,9 @@ async def generate_pdf(
         return {"success": True, "pdf": base64.b64encode(pdf_data).decode()}
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+    finally:
+        if crawler:
+            await release_crawler(crawler)
 
 
 @app.post("/execute_js")
@@ -474,7 +529,8 @@ async def execute_js(
         ```
 
     """
-    from crawler_pool import get_crawler
+    validate_url_scheme(body.url)
+    crawler = None
     try:
         cfg = CrawlerRunConfig(js_code=body.scripts)
         crawler = await get_crawler(get_default_browser_config())
@@ -485,6 +541,9 @@ async def execute_js(
         return JSONResponse(data)
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+    finally:
+        if crawler:
+            await release_crawler(crawler)
 
 
 @app.get("/llm/{url:path}")
@@ -492,13 +551,16 @@ async def llm_endpoint(
     request: Request,
     url: str = Path(...),
     q: str = Query(...),
+    provider: Optional[str] = Query(None, description="LLM provider override, e.g. 'openai/gpt-4o-mini'"),
+    temperature: Optional[float] = Query(None, description="LLM temperature override"),
+    base_url: Optional[str] = Query(None, description="LLM API base URL override"),
     _td: Dict = Depends(token_dep),
 ):
     if not q:
         raise HTTPException(400, "Query parameter 'q' is required")
     if not url.startswith(("http://", "https://")) and not url.startswith(("raw:", "raw://")):
         url = "https://" + url
-    answer = await handle_llm_qa(url, q, config)
+    answer = await handle_llm_qa(url, q, config, provider=provider, temperature=temperature, base_url=base_url)
     return JSONResponse({"answer": answer})
 
 
@@ -600,6 +662,8 @@ async def crawl(
     """
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
+    if crawl_request.hooks and not HOOKS_ENABLED:
+        raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
     # Check whether it is a redirection for a streaming request
     crawler_config = CrawlerRunConfig.load(crawl_request.crawler_config)
     if crawler_config.stream:
@@ -635,6 +699,8 @@ async def crawl_stream(
 ):
     if not crawl_request.urls:
         raise HTTPException(400, "At least one URL required")
+    if crawl_request.hooks and not HOOKS_ENABLED:
+        raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
 
     return await stream_process(crawl_request=crawl_request)
 

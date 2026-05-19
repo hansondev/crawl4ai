@@ -226,7 +226,7 @@ def merge_chunks(
 
 class VersionManager:
     def __init__(self):
-        self.home_dir = Path.home() / ".crawl4ai"
+        self.home_dir = Path(os.getenv("CRAWL4_AI_BASE_DIRECTORY", Path.home())) / ".crawl4ai"
         self.version_file = self.home_dir / "version.txt"
 
     def get_installed_version(self):
@@ -1697,7 +1697,7 @@ def extract_xml_data_legacy(tags, string):
     data = {}
 
     for tag in tags:
-        pattern = f"<{tag}>(.*?)</{tag}>"
+        pattern = f"<{tag}>((?:(?!<{tag}>).)*)</{tag}>"
         match = re.search(pattern, string, re.DOTALL)
         if match:
             data[tag] = match.group(1).strip()
@@ -1726,7 +1726,7 @@ def extract_xml_data(tags, string):
     data = {}
 
     for tag in tags:
-        pattern = f"<{tag}>(.*?)</{tag}>"
+        pattern = f"<{tag}>((?:(?!<{tag}>).)*)</{tag}>"
         matches = re.findall(pattern, string, re.DOTALL)
         
         if matches:
@@ -1748,6 +1748,7 @@ def perform_completion_with_backoff(
     base_delay=2,
     max_attempts=3,
     exponential_factor=2,
+    messages=None,
     **kwargs,
 ):
     """
@@ -1775,6 +1776,8 @@ def perform_completion_with_backoff(
 
     from litellm import completion
     from litellm.exceptions import RateLimitError
+    import litellm
+    litellm.drop_params = True  # Auto-drop unsupported params (e.g., temperature for O-series/GPT-5)
 
     extra_args = {"temperature": 0.01, "api_key": api_token, "base_url": base_url}
     if json_response:
@@ -1787,7 +1790,7 @@ def perform_completion_with_backoff(
         try:
             response = completion(
                 model=provider,
-                messages=[{"role": "user", "content": prompt_with_variables}],
+                messages=messages if messages is not None else [{"role": "user", "content": prompt_with_variables}],
                 **extra_args,
             )
             return response  # Return the successful response
@@ -1837,6 +1840,7 @@ async def aperform_completion_with_backoff(
     base_delay=2,
     max_attempts=3,
     exponential_factor=2,
+    messages=None,
     **kwargs,
 ):
     """
@@ -1864,7 +1868,9 @@ async def aperform_completion_with_backoff(
 
     from litellm import acompletion
     from litellm.exceptions import RateLimitError
+    import litellm
     import asyncio
+    litellm.drop_params = True  # Auto-drop unsupported params (e.g., temperature for O-series/GPT-5)
 
     extra_args = {"temperature": 0.01, "api_key": api_token, "base_url": base_url}
     if json_response:
@@ -1877,7 +1883,7 @@ async def aperform_completion_with_backoff(
         try:
             response = await acompletion(
                 model=provider,
-                messages=[{"role": "user", "content": prompt_with_variables}],
+                messages=messages if messages is not None else [{"role": "user", "content": prompt_with_variables}],
                 **extra_args,
             )
             return response  # Return the successful response
@@ -2288,14 +2294,14 @@ def normalize_url(
     # IMPORTANT: Don't use quote(unquote()) as it mangles + signs in URLs
     # The path from urlparse is already properly encoded
     path = parsed.path
-    if path.endswith('/') and path != '/':
-        path = path.rstrip('/')
+    # Preserve trailing slashes -- they are semantically significant per RFC 3986
+    # e.g. /page/9123/ and /page/9123 may return different responses
 
     # ── query ──
     query = parsed.query
     if query:
         # explode, mutate, then rebuild
-        params = [(k.lower(), v) for k, v in parse_qsl(query, keep_blank_values=True)]
+        params = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)]
 
         if drop_query_tracking:
             default_tracking = {
@@ -2304,7 +2310,7 @@ def normalize_url(
             }
             if extra_drop_params:
                 default_tracking |= {p.lower() for p in extra_drop_params}
-            params = [(k, v) for k, v in params if k not in default_tracking]
+            params = [(k, v) for k, v in params if k.lower() not in default_tracking]
 
         if sort_query:
             params.sort(key=lambda kv: kv[0])
@@ -2377,7 +2383,7 @@ def normalize_url_for_deep_crawl(href, base_url, preserve_https=False, original_
     normalized = urlunparse((
         parsed.scheme,
         netloc,
-        parsed.path.rstrip('/'),  # Normalize trailing slash
+        parsed.path or '/',  # Preserve trailing slash
         parsed.params,
         query,
         fragment
@@ -2416,7 +2422,7 @@ def efficient_normalize_url_for_deep_crawl(href, base_url, preserve_https=False,
     normalized = urlunparse((
         parsed.scheme,
         parsed.netloc.lower(),
-        parsed.path.rstrip('/'),
+        parsed.path or '/',  # Preserve trailing slash
         parsed.params,
         parsed.query,
         ''  # Remove fragment
@@ -2459,6 +2465,54 @@ def normalize_url_tmp(href, base_url):
         return f"{protocol}//{domain}/{href}"
 
     return href.strip()
+
+
+def quick_extract_links(html: str, base_url: str) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Fast link extraction for prefetch mode.
+    Only extracts <a href> tags - no media, no cleaning, no heavy processing.
+
+    Args:
+        html: Raw HTML string
+        base_url: Base URL for resolving relative links
+
+    Returns:
+        {"internal": [{"href": "...", "text": "..."}], "external": [...]}
+    """
+    from lxml.html import document_fromstring
+
+    try:
+        doc = document_fromstring(html)
+    except Exception:
+        return {"internal": [], "external": []}
+
+    base_domain = get_base_domain(base_url)
+    internal: List[Dict[str, str]] = []
+    external: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    for a in doc.xpath("//a[@href]"):
+        href = a.get("href", "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+
+        # Normalize URL
+        normalized = normalize_url_for_deep_crawl(href, base_url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+
+        # Extract text (truncated for memory efficiency)
+        text = (a.text_content() or "").strip()[:200]
+
+        link_data = {"href": normalized, "text": text}
+
+        if is_external_url(normalized, base_domain):
+            external.append(link_data)
+        else:
+            internal.append(link_data)
+
+    return {"internal": internal, "external": external}
 
 
 def get_base_domain(url: str) -> str:
@@ -2536,9 +2590,9 @@ def is_external_url(url: str, base_domain: str) -> bool:
         if not parsed.netloc:  # Relative URL
             return False
 
-        # Strip 'www.' from both domains for comparison
-        url_domain = parsed.netloc.lower().replace("www.", "")
-        base = base_domain.lower().replace("www.", "")
+        # Strip port and 'www.' from both domains for comparison
+        url_domain = parsed.netloc.lower().split(":")[0].replace("www.", "")
+        base = base_domain.lower().split(":")[0].replace("www.", "")
 
         # Check if URL domain ends with base domain
         return not url_domain.endswith(base)
@@ -2826,6 +2880,67 @@ def generate_content_hash(content: str) -> str:
     """Generate a unique hash for content"""
     return xxhash.xxh64(content.encode()).hexdigest()
     # return hashlib.sha256(content.encode()).hexdigest()
+
+
+def compute_head_fingerprint(head_html: str) -> str:
+    """
+    Compute a fingerprint of <head> content for cache validation.
+
+    Focuses on content that typically changes when page updates:
+    - <title>
+    - <meta name="description">
+    - <meta property="og:title|og:description|og:image|og:updated_time">
+    - <meta property="article:modified_time">
+    - <meta name="last-modified">
+
+    Uses xxhash for speed, combines multiple signals into a single hash.
+
+    Args:
+        head_html: The HTML content of the <head> section
+
+    Returns:
+        A hex string fingerprint, or empty string if no signals found
+    """
+    if not head_html:
+        return ""
+
+    head_lower = head_html.lower()
+    signals = []
+
+    # Extract title
+    title_match = re.search(r'<title[^>]*>(.*?)</title>', head_lower, re.DOTALL)
+    if title_match:
+        signals.append(title_match.group(1).strip())
+
+    # Meta tags to extract (name or property attribute, and the value to match)
+    meta_tags = [
+        ("name", "description"),
+        ("name", "last-modified"),
+        ("property", "og:title"),
+        ("property", "og:description"),
+        ("property", "og:image"),
+        ("property", "og:updated_time"),
+        ("property", "article:modified_time"),
+    ]
+
+    for attr_type, attr_value in meta_tags:
+        # Handle both attribute orders: attr="value" content="..." and content="..." attr="value"
+        patterns = [
+            rf'<meta[^>]*{attr_type}=["\']{ re.escape(attr_value)}["\'][^>]*content=["\']([^"\']*)["\']',
+            rf'<meta[^>]*content=["\']([^"\']*)["\'][^>]*{attr_type}=["\']{re.escape(attr_value)}["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, head_lower)
+            if match:
+                signals.append(match.group(1).strip())
+                break  # Found this tag, move to next
+
+    if not signals:
+        return ""
+
+    # Combine signals and hash
+    combined = '|'.join(signals)
+    return xxhash.xxh64(combined.encode()).hexdigest()
 
 
 def ensure_content_dirs(base_path: str) -> Dict[str, str]:

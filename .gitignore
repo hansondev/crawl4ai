@@ -267,6 +267,7 @@ continue_config.json
 .private/
 
 .claude/
+.context/
 
 CLAUDE_MONITOR.md
 CLAUDE.md
@@ -284,6 +285,8 @@ docs/apps/linkdin/debug*/
 docs/apps/linkdin/samples/insights/*
 
 scripts/
+!scripts/gen-sbom.sh
+!scripts/update_stats.py
 
 
 # Databse files
@@ -295,3 +298,7 @@ scripts/
 *.db
 *.rdb
 *.ldb
+MEMORY.md
+
+# Handoff files
+HANDOFF-*.md
